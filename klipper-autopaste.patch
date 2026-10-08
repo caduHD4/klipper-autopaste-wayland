@@ -1,0 +1,1041 @@
+diff --git a/klipper/CMakeLists.txt b/klipper/CMakeLists.txt
+index e6c4952..97dc20e 100644
+--- a/klipper/CMakeLists.txt
++++ b/klipper/CMakeLists.txt
+@@ -3,6 +3,7 @@ add_definitions(-DTRANSLATION_DOMAIN=\"klipper\")
+ 
+ set(libklipper_common_SRCS
+     klipper.cpp
++    autopastehelpers.cpp autopastehelpers.h
+     urlgrabber.cpp urlgrabber.h
+     configdialog.cpp configdialog.h
+     historycycler.cpp historycycler.h
+diff --git a/klipper/autopastehelpers.cpp b/klipper/autopastehelpers.cpp
+new file mode 100644
+index 0000000..c645a69
+--- /dev/null
++++ b/klipper/autopastehelpers.cpp
+@@ -0,0 +1,168 @@
++/*
++    SPDX-FileCopyrightText: 2026 Guillermo Steren
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include "autopastehelpers.h"
++
++#include <QKeyCombination>
++#include <QKeySequence>
++#include <QObject>
++#include <wayland-client-protocol.h>
++#include <KWayland/Client/connection_thread.h>
++#include <KWayland/Client/fakeinput.h>
++#include <linux/input-event-codes.h>
++#include <wayland-client-core.h>
++
++namespace KlipperAutoPaste
++{
++
++namespace {
++class DisplaySync final : public QObject
++{
++public:
++    explicit DisplaySync(QObject *owner, std::function<void()> done)
++        : QObject(owner), done(std::move(done)) {}
++    ~DisplaySync() override { if (callback) wl_callback_destroy(callback); }
++    wl_callback *callback = nullptr;
++    std::function<void()> done;
++    static void finished(void *data, wl_callback *, uint32_t)
++    {
++        auto *self = static_cast<DisplaySync *>(data);
++        auto done = std::move(self->done);
++        delete self;
++        done();
++    }
++};
++}
++
++bool afterWaylandSync(QObject *owner, std::function<void()> done)
++{
++    auto *connection = KWayland::Client::ConnectionThread::fromApplication();
++    if (!connection || !connection->display()) return false;
++    auto *sync = new DisplaySync(owner, std::move(done));
++    sync->callback = wl_display_sync(connection->display());
++    if (!sync->callback) { delete sync; return false; }
++    static const wl_callback_listener listener = {DisplaySync::finished};
++    wl_callback_add_listener(sync->callback, &listener, sync);
++    wl_display_flush(connection->display());
++    return true;
++}
++
++PasteChord pasteChordFromStandard()
++{
++    const QList<QKeySequence> bindings = QKeySequence::keyBindings(QKeySequence::Paste);
++    for (const QKeySequence &seq : bindings) {
++        if (seq.isEmpty()) {
++            continue;
++        }
++        const QKeyCombination combo = seq[0];
++        const Qt::Key key = combo.key();
++        if (key != Qt::Key_unknown && key != Qt::Key(0)) {
++            return {combo.keyboardModifiers(), key};
++        }
++    }
++    return {};
++}
++
++static int qtLatinKeyToEvdev(Qt::Key key)
++{
++    switch (key) {
++    case Qt::Key_A:
++        return KEY_A;
++    case Qt::Key_B:
++        return KEY_B;
++    case Qt::Key_C:
++        return KEY_C;
++    case Qt::Key_D:
++        return KEY_D;
++    case Qt::Key_E:
++        return KEY_E;
++    case Qt::Key_F:
++        return KEY_F;
++    case Qt::Key_G:
++        return KEY_G;
++    case Qt::Key_H:
++        return KEY_H;
++    case Qt::Key_I:
++        return KEY_I;
++    case Qt::Key_J:
++        return KEY_J;
++    case Qt::Key_K:
++        return KEY_K;
++    case Qt::Key_L:
++        return KEY_L;
++    case Qt::Key_M:
++        return KEY_M;
++    case Qt::Key_N:
++        return KEY_N;
++    case Qt::Key_O:
++        return KEY_O;
++    case Qt::Key_P:
++        return KEY_P;
++    case Qt::Key_Q:
++        return KEY_Q;
++    case Qt::Key_R:
++        return KEY_R;
++    case Qt::Key_S:
++        return KEY_S;
++    case Qt::Key_T:
++        return KEY_T;
++    case Qt::Key_U:
++        return KEY_U;
++    case Qt::Key_V:
++        return KEY_V;
++    case Qt::Key_W:
++        return KEY_W;
++    case Qt::Key_X:
++        return KEY_X;
++    case Qt::Key_Y:
++        return KEY_Y;
++    case Qt::Key_Z:
++        return KEY_Z;
++    default:
++        return KEY_V;
++    }
++}
++
++static void appendModifierEvdev(Qt::KeyboardModifiers modifiers, QList<int> *out)
++{
++    if (modifiers & Qt::MetaModifier) {
++        out->append(KEY_LEFTMETA);
++    }
++    if (modifiers & Qt::ControlModifier) {
++        out->append(KEY_LEFTCTRL);
++    }
++    if (modifiers & Qt::AltModifier) {
++        out->append(KEY_LEFTALT);
++    }
++    if (modifiers & Qt::ShiftModifier) {
++        out->append(KEY_LEFTSHIFT);
++    }
++}
++
++void injectPasteShortcutWaylandFakeInput(KWayland::Client::FakeInput *fakeInput, const PasteChord &chord)
++{
++    if (!fakeInput || !fakeInput->isValid()) {
++        return;
++    }
++
++    QList<int> modifiers;
++    appendModifierEvdev(chord.modifiers, &modifiers);
++    const int key = qtLatinKeyToEvdev(chord.key);
++
++    for (const int modifier : modifiers) {
++        fakeInput->requestKeyboardKeyPress(modifier);
++    }
++    fakeInput->requestKeyboardKeyPress(key);
++    fakeInput->requestKeyboardKeyRelease(key);
++    for (qsizetype i = modifiers.size() - 1; i >= 0; --i) {
++        fakeInput->requestKeyboardKeyRelease(modifiers.at(i));
++    }
++    if (auto *connection = KWayland::Client::ConnectionThread::fromApplication()) {
++        wl_display_flush(connection->display());
++    }
++}
++
++} // namespace KlipperAutoPaste
+diff --git a/klipper/autopastehelpers.h b/klipper/autopastehelpers.h
+new file mode 100644
+index 0000000..9d3fdff
+--- /dev/null
++++ b/klipper/autopastehelpers.h
+@@ -0,0 +1,32 @@
++/*
++    SPDX-FileCopyrightText: 2026 Guillermo Steren
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#pragma once
++
++#include <QList>
++#include <Qt>
++#include <functional>
++
++class QObject;
++
++namespace KWayland::Client {
++class FakeInput;
++}
++
++namespace KlipperAutoPaste
++{
++
++struct PasteChord {
++    Qt::KeyboardModifiers modifiers = Qt::ControlModifier;
++    Qt::Key key = Qt::Key_V;
++};
++
++/** Paste shortcut from the user's standard key bindings (first binding wins). */
++[[nodiscard]] PasteChord pasteChordFromStandard();
++bool afterWaylandSync(QObject *owner, std::function<void()> done);
++void injectPasteShortcutWaylandFakeInput(KWayland::Client::FakeInput *fakeInput, const PasteChord &chord);
++
++} // namespace KlipperAutoPaste
+diff --git a/klipper/autotests/historymodeltest.cpp b/klipper/autotests/historymodeltest.cpp
+index 98f0d1a..d4afafa 100644
+--- a/klipper/autotests/historymodeltest.cpp
++++ b/klipper/autotests/historymodeltest.cpp
+@@ -8,8 +8,11 @@
+ #include "../historyitem.h"
+ #include "systemclipboard.h"
+ 
++#include <QAbstractItemModel>
+ #include <QAbstractItemModelTester>
++#include <QCryptographicHash>
+ #include <QMimeData>
++#include <QSignalSpy>
+ #include <QStandardPaths>
+ #include <QTest>
+ 
+@@ -28,6 +31,9 @@ private Q_SLOTS:
+     void testIndexOf();
+     void testType_data();
+     void testType();
++    void testMoveToTopWhenAlreadyTopEmitsChangedIsTopWithoutReorder();
++    void testMoveToTopFromClipboardMenuEmitsActivated();
++    void testMoveToTopAloneDoesNotEmitHistoryMenuEntryActivated();
+     void testKeepClipboardContents();
+ };
+ 
+@@ -205,6 +211,58 @@ void HistoryModelTest::testType()
+     QTRY_COMPARE(history->pendingJobs(), 0);
+ }
+ 
++void HistoryModelTest::testMoveToTopWhenAlreadyTopEmitsChangedIsTopWithoutReorder()
++{
++    SystemClipboard::self()->clear();
++    std::shared_ptr<HistoryModel> history = HistoryModel::self();
++    std::unique_ptr<QAbstractItemModelTester> modelTest(new QAbstractItemModelTester(history.get()));
++    history->setMaxSize(10);
++    history->clear();
++    QTRY_COMPARE(history->pendingJobs(), 0);
++
++    history->insert(QStringLiteral("foo"));
++    const QString barText = QStringLiteral("bar");
++    history->insert(barText);
++    const QString barUuid = QString::fromLatin1(QCryptographicHash::hash(barText.toUtf8(), QCryptographicHash::Sha1).toHex());
++    QCOMPARE(history->data(history->index(0, 0)).toString(), barText);
++
++    QSignalSpy spyRowsMoved(history.get(), &QAbstractItemModel::rowsMoved);
++    QSignalSpy spyChanged(history.get(), &HistoryModel::changed);
++
++    history->moveToTop(barUuid);
++
++    QCOMPARE(spyRowsMoved.count(), 0);
++    QCOMPARE(history->data(history->index(0, 0)).toString(), barText);
++    QCOMPARE(spyChanged.count(), 1);
++    QCOMPARE(spyChanged.at(0).at(0).toBool(), true);
++}
++
++void HistoryModelTest::testMoveToTopFromClipboardMenuEmitsActivated()
++{
++    SystemClipboard::self()->clear();
++    std::shared_ptr<HistoryModel> history = HistoryModel::self();
++    QVERIFY(history->insert(QStringLiteral("foo")));
++    const QString fooUuid =
++        QString::fromLatin1(QCryptographicHash::hash(QByteArrayLiteral("foo"), QCryptographicHash::Sha1).toHex());
++    QSignalSpy spy(history.get(), &HistoryModel::historyMenuEntryActivated);
++    history->moveToTopFromClipboardMenu(fooUuid);
++    QCOMPARE(spy.count(), 1);
++}
++
++void HistoryModelTest::testMoveToTopAloneDoesNotEmitHistoryMenuEntryActivated()
++{
++    SystemClipboard::self()->clear();
++    std::shared_ptr<HistoryModel> history = HistoryModel::self();
++    QVERIFY(history->insert(QStringLiteral("foo")));
++    history->insert(QStringLiteral("bar"));
++    // Order is [bar, foo]; moving foo to top reorders without menu-only signal (e.g. EditPage path).
++    const QString fooUuid =
++        QString::fromLatin1(QCryptographicHash::hash(QByteArrayLiteral("foo"), QCryptographicHash::Sha1).toHex());
++    QSignalSpy spy(history.get(), &HistoryModel::historyMenuEntryActivated);
++    history->moveToTop(fooUuid);
++    QCOMPARE(spy.count(), 0);
++}
++
+ void HistoryModelTest::testKeepClipboardContents()
+ {
+     auto setKeepClipboardContents = [](bool value) {
+@@ -218,6 +276,12 @@ void HistoryModelTest::testKeepClipboardContents()
+         history->loadSettings();
+     };
+ 
++    {
++        std::shared_ptr<HistoryModel> history = HistoryModel::self();
++        history->clear();
++        QTRY_COMPARE(history->pendingJobs(), 0);
++    }
++
+     {
+         std::shared_ptr<HistoryModel> history = HistoryModel::self();
+         setKeepClipboardContents(true);
+diff --git a/klipper/configdialog.cpp b/klipper/configdialog.cpp
+index 523f723..c3ac429 100644
+--- a/klipper/configdialog.cpp
++++ b/klipper/configdialog.cpp
+@@ -91,6 +91,13 @@ GeneralWidget::GeneralWidget(QWidget *parent)
+     KLocalization::setupSpinBoxFormatString(m_historySizeSb, ki18ncp("Number of entries", "%v entry", "%v entries"));
+     layout->addRow(item->label(), m_historySizeSb);
+ 
++    item = KlipperSettings::self()->autoPasteItem();
++    m_autoPasteLabel = new QLabel(i18n("After choosing from history:"), this);
++    m_autoPasteCb = new QCheckBox(item->label(), this);
++    m_autoPasteCb->setObjectName(QLatin1String("kcfg_AutoPaste"));
++    connect(m_autoPasteCb, &QAbstractButton::toggled, this, &GeneralWidget::widgetChanged);
++    layout->addRow(m_autoPasteLabel, m_autoPasteCb);
++
+     layout->addRow(QString(), new QLabel(this));
+ 
+     // Synchronise selection and clipboard
+@@ -192,6 +199,17 @@ If it is turned off, the selection may still be saved in the clipboard history (
+     m_havePrevAlwaysImageTextConfig = false;
+ }
+ 
++void GeneralWidget::updateAutoPasteOptionState(const Klipper *klipper)
++{
++    if (!m_autoPasteLabel || !m_autoPasteCb) {
++        return;
++    }
++    const bool canRun = klipper && klipper->isAutoPasteOptionVisible();
++    m_autoPasteLabel->setVisible(canRun);
++    m_autoPasteCb->setVisible(canRun);
++    m_autoPasteCb->setToolTip(QString());
++}
++
+ void GeneralWidget::updateWidgets()
+ {
+     // Initialise widgets which are not managed by KConfigDialogManager
+@@ -565,6 +583,7 @@ bool ActionsWidget::hasChanged() const
+ 
+ void ActionsWidget::onItemChanged(QTreeWidgetItem *item, int col)
+ {
++    Q_UNUSED(col);
+     QTreeWidgetItem *parentItem = item->parent(); // parent of the command item
+     if (parentItem == nullptr) { // this is a top level action
+         return;
+@@ -614,6 +633,12 @@ ConfigDialog::ConfigDialog(QWidget *parent, KConfigSkeleton *skeleton, Klipper *
+ 
+     connect(this, &KConfigDialog::widgetModified, m_generalPage, &GeneralWidget::slotWidgetModified);
+     m_generalPage->initWidgetStates();
++    m_generalPage->updateAutoPasteOptionState(m_klipper);
++    if (m_klipper) {
++        connect(m_klipper, &Klipper::autoPasteSupportChanged, this, [this](bool) {
++            m_generalPage->updateAutoPasteOptionState(m_klipper);
++        });
++    }
+ 
+     // from KWindowConfig::restoreWindowSize() API documentation
+     (void)winId();
+@@ -664,6 +689,7 @@ void ConfigDialog::updateWidgets()
+     }
+ 
+     m_generalPage->updateWidgets();
++    m_generalPage->updateAutoPasteOptionState(m_klipper);
+ }
+ 
+ void ConfigDialog::updateWidgetsDefault()
+diff --git a/klipper/configdialog.h b/klipper/configdialog.h
+index 92667d5..d9a3ff2 100644
+--- a/klipper/configdialog.h
++++ b/klipper/configdialog.h
+@@ -33,6 +33,8 @@ public:
+     void updateWidgets();
+     void initWidgetStates();
+ 
++    void updateAutoPasteOptionState(const Klipper *klipper);
++
+ Q_SIGNALS:
+     void widgetChanged();
+ 
+@@ -41,6 +43,8 @@ public Q_SLOTS:
+ 
+ private:
+     QCheckBox *m_enableHistoryCb;
++    QLabel *m_autoPasteLabel = nullptr;
++    QCheckBox *m_autoPasteCb = nullptr;
+     QCheckBox *m_syncClipboardsCb;
+ 
+     QRadioButton *m_alwaysTextRb;
+diff --git a/klipper/declarative/declarativehistorymodel.cpp b/klipper/declarative/declarativehistorymodel.cpp
+index c964e1d..ab041ef 100644
+--- a/klipper/declarative/declarativehistorymodel.cpp
++++ b/klipper/declarative/declarativehistorymodel.cpp
+@@ -71,6 +71,11 @@ void DeclarativeHistoryModel::moveToTop(const QString &uuid)
+     m_model->moveToTop(uuid);
+ }
+ 
++void DeclarativeHistoryModel::moveToTopFromClipboardMenu(const QString &uuid)
++{
++    m_model->moveToTopFromClipboardMenu(uuid);
++}
++
+ void DeclarativeHistoryModel::remove(const QString &uuid)
+ {
+     m_model->remove(uuid);
+diff --git a/klipper/declarative/declarativehistorymodel.h b/klipper/declarative/declarativehistorymodel.h
+index d820c23..d13a633 100644
+--- a/klipper/declarative/declarativehistorymodel.h
++++ b/klipper/declarative/declarativehistorymodel.h
+@@ -39,6 +39,7 @@ public:
+     void setStarredOnly(bool value);
+ 
+     Q_INVOKABLE void moveToTop(const QString &uuid);
++    Q_INVOKABLE void moveToTopFromClipboardMenu(const QString &uuid);
+ 
+     Q_INVOKABLE void remove(const QString &uuid);
+     Q_INVOKABLE void clearHistory();
+diff --git a/klipper/declarative/qml/ClipboardMenu.qml b/klipper/declarative/qml/ClipboardMenu.qml
+index 2d6eb5e..e94c097 100644
+--- a/klipper/declarative/qml/ClipboardMenu.qml
++++ b/klipper/declarative/qml/ClipboardMenu.qml
+@@ -47,7 +47,10 @@ PlasmaComponents3.ScrollView {
+ 
+     PlasmaComponents3.ScrollBar.horizontal.policy: PlasmaComponents3.ScrollBar.AlwaysOff
+ 
+-    onItemSelected: uuid => model.moveToTop(uuid);
++    onItemSelected: uuid => {
++        model.moveToTopFromClipboardMenu(uuid);
++        dialogItem.requestHidePopup();
++    }
+     onRemove: uuid => model.remove(uuid)
+     onEdit: modelData => {
+         clipboardMenu.T.StackView.view.push(Qt.resolvedUrl("EditPage.qml"), {
+diff --git a/klipper/declarative/qml/KlipperPopup.qml b/klipper/declarative/qml/KlipperPopup.qml
+index 75f8931..fda6761 100644
+--- a/klipper/declarative/qml/KlipperPopup.qml
++++ b/klipper/declarative/qml/KlipperPopup.qml
+@@ -77,8 +77,6 @@ PlasmaExtras.Representation {
+             model: historyModel
+             showsClearHistoryButton: true
+             barcodeType: "QRCode"
+-
+-            onItemSelected: dialogItem.requestHidePopup()
+         }
+     }
+ }
+diff --git a/klipper/historymodel.cpp b/klipper/historymodel.cpp
+index 48ffe1f..afc50eb 100644
+--- a/klipper/historymodel.cpp
++++ b/klipper/historymodel.cpp
+@@ -588,7 +588,6 @@ bool HistoryModel::insert(const QMimeData *mimeData, qreal timestamp)
+         return false;
+     }
+     if (const int existingItemIndex = indexOf(uuid); existingItemIndex >= 0) {
+-        // move to top
+         moveToTop(existingItemIndex);
+         return true;
+     }
+@@ -795,6 +794,15 @@ int HistoryModel::pendingJobs() const
+     return m_pendingJobs;
+ }
+ 
++void HistoryModel::moveToTopFromClipboardMenu(const QString &uuid)
++{
++    if (indexOf(uuid) < 0) {
++        return;
++    }
++    moveToTop(uuid);
++    Q_EMIT historyMenuEntryActivated(uuid);
++}
++
+ void HistoryModel::moveToTop(const QString &uuid)
+ {
+     const int existingItemIndex = indexOf(uuid);
+@@ -818,7 +826,7 @@ void HistoryModel::moveToTop(qsizetype row)
+     if (row == 0) {
+         // The item is already at the top, but it still may be not be set as the actual clipboard
+         // contents, normally this happens if the item is only in the X11 mouse selection but
+-        // not in the Ctrl+V clipboard, or if the current contents are not saved in the history.
++        // not in the Ctrl+V clipboard.
+         Q_EMIT changed(true);
+         return;
+     }
+diff --git a/klipper/historymodel.h b/klipper/historymodel.h
+index 2aa60bc..fbd0be7 100644
+--- a/klipper/historymodel.h
++++ b/klipper/historymodel.h
+@@ -96,11 +96,15 @@ public:
+ 
+     int pendingJobs() const;
+ 
++    void moveToTopFromClipboardMenu(const QString &uuid);
++
+ Q_SIGNALS:
+     void changed(bool isTop = false);
+ 
+     void actionInvoked(const std::shared_ptr<const HistoryItem> &item);
+ 
++    void historyMenuEntryActivated(const QString &uuid);
++
+ private Q_SLOTS:
+     /**
+      * Check data in clipboard, and if it passes these checks,
+diff --git a/klipper/klipper.cpp b/klipper/klipper.cpp
+index 07d687c..51d37af 100644
+--- a/klipper/klipper.cpp
++++ b/klipper/klipper.cpp
+@@ -10,10 +10,15 @@
+ 
+ #include "klipper.h"
+ 
++#include "autopastehelpers.h"
+ #include "klipper_debug.h"
+ #include <QDBusConnection>
++#include <QGuiApplication>
++#include <QKeySequence>
+ #include <QMenu>
+ #include <QMimeData>
++#include <QTimer>
++#include <QWindow>
+ 
+ #include <KActionCollection>
+ #include <KGlobalAccel>
+@@ -21,7 +26,9 @@
+ #include <KNotification>
+ #include <KToggleAction>
+ #include <KWayland/Client/connection_thread.h>
++#include <KWayland/Client/fakeinput.h>
+ #include <KWayland/Client/plasmashell.h>
++#include <KWayland/Client/plasmawindowmanagement.h>
+ #include <KWayland/Client/registry.h>
+ #include <KWayland/Client/surface.h>
+ #include <KWindowSystem>
+@@ -57,6 +64,10 @@ Klipper::Klipper(QObject *parent)
+     : QObject(parent)
+     , m_clip(SystemClipboard::self())
+     , m_historyCycler(new HistoryCycler(this))
++    , m_bAutoPaste(false)
++    , m_pendingAutoPasteAfterHistorySelection(false)
++    , m_pendingAutoPasteClipboardReady(false)
++    , m_pendingAutoPasteFocusRestored(false)
+     , m_plasmashell(nullptr)
+ {
+     QDBusConnection::sessionBus().registerService(QStringLiteral("org.kde.klipper"));
+@@ -66,8 +77,29 @@ Klipper::Klipper(QObject *parent)
+ 
+     m_historyModel = HistoryModel::self();
+     m_popup = std::make_unique<KlipperPopup>();
++    connect(m_popup.get(), &KlipperPopup::clipboardPopupOpening, this, [this] {
++        clearClipboardPopupAutoPastePending();
++        m_autoPasteTarget = m_windowManagement ? m_windowManagement->activeWindow() : nullptr;
++        m_autoPasteTargetWasWindow = !m_autoPasteTarget.isNull();
++    });
++    connect(m_popup.get(), &QWindow::visibleChanged, this, [this](bool visible) {
++        if (!visible) onClipboardPopupHiddenForAutoPaste();
++    });
+     connect(m_historyModel.get(), &HistoryModel::changed, this, &Klipper::slotHistoryChanged);
+     connect(m_historyModel.get(), &HistoryModel::changed, this, &Klipper::clipboardHistoryUpdated);
++    connect(m_historyModel.get(), &HistoryModel::historyMenuEntryActivated, this, &Klipper::slotHistoryMenuEntryActivated);
++    connect(m_clip.get(), &SystemClipboard::historyItemClipboardSet, this, [this](const QString &uuid, int success) {
++        if (!m_pendingAutoPasteAfterHistorySelection || uuid != m_pendingAutoPasteUuid) {
++            return;
++        }
++        if (!success) {
++            qCWarning(KLIPPER_LOG) << "Auto-paste cancelled: selected history item could not be restored";
++            clearClipboardPopupAutoPastePending();
++            return;
++        }
++        m_pendingAutoPasteClipboardReady = true;
++        tryAutoPasteHistorySelection();
++    });
+ 
+     // we need that collection, otherwise KToggleAction is not happy :}
+     m_collection = new KActionCollection(this);
+@@ -148,20 +180,111 @@ Klipper::Klipper(QObject *parent)
+     });
+ 
+     if (KWindowSystem::isPlatformWayland()) {
+-        auto registry = new KWayland::Client::Registry(this);
+-        auto connection = KWayland::Client::ConnectionThread::fromApplication(qGuiApp);
+-        connect(registry, &KWayland::Client::Registry::plasmaShellAnnounced, this, [registry, this](quint32 name, quint32 version) {
+-            if (!m_plasmashell) {
+-                m_plasmashell = registry->createPlasmaShell(name, version);
+-                m_popup->setPlasmaShell(m_plasmashell);
++        QTimer::singleShot(0, this, &Klipper::setupWaylandFakeInputIntegration);
++    }
++}
++
++void Klipper::setupWaylandFakeInputIntegration()
++{
++    if (!KWindowSystem::isPlatformWayland()) {
++        return;
++    }
++    auto *connection = KWayland::Client::ConnectionThread::fromApplication(this);
++    if (!connection) {
++        qCWarning(KLIPPER_LOG) << "KWayland ConnectionThread::fromApplication returned null";
++        return;
++    }
++    auto *registry = new KWayland::Client::Registry(this);
++    connect(registry, &KWayland::Client::Registry::plasmaShellAnnounced, this, [registry, this](quint32 name, quint32 version) {
++        if (!m_plasmashell) {
++            m_plasmashell = registry->createPlasmaShell(name, version);
++            m_popup->setPlasmaShell(m_plasmashell);
++        }
++    });
++    connect(registry, &KWayland::Client::Registry::plasmaWindowManagementAnnounced, this,
++            [this, registry](quint32 name, quint32 version) {
++        if (m_windowManagement) return;
++        m_windowManagement = registry->createPlasmaWindowManagement(name, version, this);
++        connect(m_windowManagement, &KWayland::Client::PlasmaWindowManagement::activeWindowChanged,
++                this, &Klipper::tryAutoPasteHistorySelection);
++    });
++    connect(registry, &KWayland::Client::Registry::fakeInputAnnounced, this, [this, registry](quint32, quint32) {
++        tryBindFakeInput(registry);
++    });
++    connect(registry, &KWayland::Client::Registry::interfaceAnnounced, this, [this, registry](const QByteArray &interface, quint32, quint32) {
++        if (interface == QByteArrayLiteral("org_kde_kwin_fake_input")) {
++            tryBindFakeInput(registry);
++        }
++    });
++    connect(registry, &KWayland::Client::Registry::interfacesAnnounced, this, [this, registry]() {
++        tryBindFakeInput(registry);
++    });
++    connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, registry, [registry] {
++        delete registry;
++    });
++    registry->create(connection);
++    registry->setup();
++    for (int i = 0; i < 3; ++i) {
++        connection->roundtrip();
++        tryBindFakeInput(registry);
++        if (m_fakeInput) {
++            break;
++        }
++    }
++    if (!m_fakeInput) {
++        qCWarning(KLIPPER_LOG) << "FakeInput not bound after initial roundtrips; retrying";
++        const auto retry = [this, connection, registry]() {
++            if (m_fakeInput) {
++                return;
+             }
++            connection->roundtrip();
++            tryBindFakeInput(registry);
++        };
++        QTimer::singleShot(100, this, retry);
++        QTimer::singleShot(500, this, retry);
++        QTimer::singleShot(2000, this, retry);
++    }
++}
++
++void Klipper::tryBindFakeInput(KWayland::Client::Registry *registry)
++{
++#if !defined(__linux__)
++    Q_UNUSED(registry);
++    return;
++#else
++    if (m_fakeInput) {
++        return;
++    }
++    if (!registry->hasInterface(KWayland::Client::Registry::Interface::FakeInput)) {
++        return;
++    }
++    const auto iface = registry->interface(KWayland::Client::Registry::Interface::FakeInput);
++    if (iface.name == 0 && iface.version == 0) {
++        qCWarning(KLIPPER_LOG) << "Wayland FakeInput interface has invalid name/version";
++        return;
++    }
++    m_fakeInput = registry->createFakeInput(iface.name, iface.version, this);
++    if (!m_fakeInput) {
++        qCWarning(KLIPPER_LOG) << "FakeInput createFakeInput returned null";
++        return;
++    }
++    if (!m_fakeInput->isValid()) {
++        qCWarning(KLIPPER_LOG) << "FakeInput not valid yet; retrying after event loop";
++        QTimer::singleShot(0, this, [this]() {
++            if (!m_fakeInput || !m_fakeInput->isValid()) {
++                qCWarning(KLIPPER_LOG) << "FakeInput still invalid; auto-paste unavailable";
++                return;
++            }
++            m_fakeInput->authenticate(QLatin1String("Klipper"),
++                                      i18n("Automatically paste after choosing an entry from the clipboard history."));
++            Q_EMIT autoPasteSupportChanged(true);
+         });
+-        connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, registry, [registry] {
+-            delete registry; // Avoid freeing resource when gui is deleted
+-        });
+-        registry->create(connection);
+-        registry->setup();
++        return;
+     }
++    m_fakeInput->authenticate(QLatin1String("Klipper"),
++                              i18n("Automatically paste after choosing an entry from the clipboard history."));
++    Q_EMIT autoPasteSupportChanged(true);
++#endif
+ }
+ 
+ Klipper::~Klipper()
+@@ -189,8 +312,8 @@ void Klipper::reloadConfig()
+ {
+     if (calledFromDBus()) {
+         KlipperSettings::self()->sharedConfig()->reparseConfiguration();
+-        KlipperSettings::self()->read();
+     }
++    KlipperSettings::self()->read();
+     loadSettings();
+ }
+ 
+@@ -234,6 +357,7 @@ void Klipper::slotStartShowTimer()
+ void Klipper::loadSettings()
+ {
+     m_bReplayActionInHistory = KlipperSettings::replayActionInHistory();
++    m_bAutoPaste = KlipperSettings::autoPaste();
+ 
+     m_bURLGrabber = KlipperSettings::uRLGrabberEnabled();
+     // this will cause it to loadSettings too
+@@ -372,6 +496,112 @@ void Klipper::slotHistoryChanged(bool isTop)
+     }
+ }
+ 
++bool Klipper::isAutoPasteSupported() const
++{
++    return KWindowSystem::isPlatformWayland();
++}
++
++bool Klipper::isAutoPasteInjectReady() const
++{
++    return KWindowSystem::isPlatformWayland() && m_fakeInput && m_fakeInput->isValid() &&
++        m_windowManagement && m_windowManagement->isValid();
++}
++
++void Klipper::slotHistoryMenuEntryActivated(const QString &uuid)
++{
++    if (!m_bAutoPaste || !isAutoPasteInjectReady()) {
++        return;
++    }
++    if (m_clip->isLocked(QClipboard::Selection) || m_clip->isLocked(QClipboard::Clipboard)) {
++        return;
++    }
++    m_pendingAutoPasteAfterHistorySelection = true;
++    m_pendingAutoPasteClipboardReady = false;
++    m_pendingAutoPasteFocusRestored = false;
++    m_pendingAutoPasteUuid = uuid;
++    const auto generation = m_autoPasteGeneration;
++    QTimer::singleShot(2000, this, [this, generation] {
++        if (generation == m_autoPasteGeneration && m_pendingAutoPasteAfterHistorySelection) {
++            qCWarning(KLIPPER_LOG) << "Auto-paste cancelled: clipboard/focus confirmation timed out";
++            clearClipboardPopupAutoPastePending();
++        }
++    });
++}
++
++void Klipper::clearClipboardPopupAutoPastePending()
++{
++    ++m_autoPasteGeneration;
++    m_autoPasteTarget.clear();
++    m_autoPasteTargetWasWindow = false;
++    m_pendingAutoPasteAfterHistorySelection = false;
++    m_pendingAutoPasteClipboardReady = false;
++    m_pendingAutoPasteFocusRestored = false;
++    m_pendingAutoPasteUuid.clear();
++}
++
++void Klipper::onClipboardPopupHiddenForAutoPaste()
++{
++    if (!m_pendingAutoPasteAfterHistorySelection || !m_bAutoPaste) return;
++    const auto generation = m_autoPasteGeneration;
++    // Qt can retain focusWindow() after its popup is hidden. A compositor ACK
++    // of the unmap is the reliable boundary before restoring external focus.
++    QTimer::singleShot(0, this, [this, generation] {
++        if (generation != m_autoPasteGeneration || m_popup->isVisible()) return;
++        if (!KlipperAutoPaste::afterWaylandSync(this, [this, generation] {
++            if (generation != m_autoPasteGeneration || m_popup->isVisible() ||
++                !m_pendingAutoPasteAfterHistorySelection) return;
++            if (m_autoPasteTargetWasWindow && !m_autoPasteTarget) {
++                clearClipboardPopupAutoPastePending();
++                return;
++            }
++            m_pendingAutoPasteFocusRestored = true;
++            if (m_autoPasteTarget && m_windowManagement &&
++                m_windowManagement->activeWindow() != m_autoPasteTarget) {
++                m_autoPasteTarget->requestActivate();
++            }
++            tryAutoPasteHistorySelection();
++        })) clearClipboardPopupAutoPastePending();
++    });
++}
++
++bool Klipper::isAutoPasteDestinationActive() const
++{
++    if (!m_windowManagement || !m_windowManagement->isValid()) return false;
++    auto *active = m_windowManagement->activeWindow();
++    return m_autoPasteTargetWasWindow ? m_autoPasteTarget && active == m_autoPasteTarget : !active;
++}
++
++void Klipper::tryAutoPasteHistorySelection()
++{
++    if (!m_pendingAutoPasteAfterHistorySelection || !m_pendingAutoPasteClipboardReady ||
++        !m_pendingAutoPasteFocusRestored || m_popup->isVisible()) return;
++    if (!isAutoPasteDestinationActive()) return;
++    // The hide ACK and clipboard job can finish in either order. Send once,
++    // only while the exact original destination remains active.
++    const auto generation = m_autoPasteGeneration;
++    QTimer::singleShot(0, this, [this, generation] {
++        if (generation != m_autoPasteGeneration || !m_pendingAutoPasteAfterHistorySelection ||
++            !m_bAutoPaste || m_popup->isVisible()) return;
++        if (!isAutoPasteDestinationActive()) return;
++        if (m_clip->isLocked(QClipboard::Selection) || m_clip->isLocked(QClipboard::Clipboard)) return;
++        simulatePaste();
++        clearClipboardPopupAutoPastePending();
++    });
++}
++
++void Klipper::simulatePaste()
++{
++    if (!isAutoPasteInjectReady()) {
++        return;
++    }
++    if (!m_fakeInput || !m_fakeInput->isValid()) {
++        qCWarning(KLIPPER_LOG) << "Auto-paste unavailable: KWin FakeInput is not authenticated";
++        return;
++    }
++    KlipperAutoPaste::injectPasteShortcutWaylandFakeInput(
++        m_fakeInput, KlipperAutoPaste::pasteChordFromStandard());
++}
++
+ QStringList Klipper::getClipboardHistoryMenu()
+ {
+     QStringList menu;
+diff --git a/klipper/klipper.h b/klipper/klipper.h
+index 659e6cd..4fb55aa 100644
+--- a/klipper/klipper.h
++++ b/klipper/klipper.h
+@@ -8,6 +8,7 @@
+ #pragma once
+ 
+ #include "config-klipper.h"
++#include <config-X11.h>
+ 
+ #include <QClipboard>
+ #include <QDBusContext>
+@@ -29,11 +30,16 @@ class QMimeData;
+ class HistoryItem;
+ class HistoryModel;
+ class KNotification;
++class QWindow;
+ class SystemClipboard;
+ 
+ namespace KWayland::Client
+ {
+ class PlasmaShell;
++class FakeInput;
++class Registry;
++class PlasmaWindowManagement;
++class PlasmaWindow;
+ }
+ 
+ class KLIPPER_EXPORT Klipper : public QObject, public QDBusContext
+@@ -77,6 +83,13 @@ public:
+         return m_popup.get();
+     }
+ 
++    bool isAutoPasteSupported() const;
++    bool isAutoPasteInjectReady() const;
++    bool isAutoPasteOptionVisible() const
++    {
++        return isAutoPasteSupported() && isAutoPasteInjectReady();
++    }
++
+ public Q_SLOTS:
+     void saveSession();
+     void slotConfigure();
+@@ -87,6 +100,7 @@ Q_SIGNALS:
+     void passivePopup(const QString &caption, const QString &text);
+     void editFinished(std::shared_ptr<const HistoryItem> item, int result);
+     Q_SCRIPTABLE void clipboardHistoryUpdated();
++    void autoPasteSupportChanged(bool available);
+ 
+ public Q_SLOTS:
+     void slotPopupMenu();
+@@ -98,13 +112,23 @@ protected Q_SLOTS:
+ 
+ private Q_SLOTS:
+     void slotHistoryChanged(bool isTop = false);
++    void slotHistoryMenuEntryActivated(const QString &uuid);
++    void simulatePaste();
+ 
+     void slotStartShowTimer();
+ 
+     void loadSettings();
+ 
++private Q_SLOTS:
++    void clearClipboardPopupAutoPastePending();
++    void onClipboardPopupHiddenForAutoPaste();
++    void tryAutoPasteHistorySelection();
++    bool isAutoPasteDestinationActive() const;
++
+ private:
+     static void updateTimestamp();
++    void setupWaylandFakeInputIntegration();
++    void tryBindFakeInput(KWayland::Client::Registry *registry);
+ 
+     std::shared_ptr<SystemClipboard> m_clip;
+     HistoryCycler *m_historyCycler = nullptr;
+@@ -125,6 +149,16 @@ private:
+ 
+     bool m_bURLGrabber : 1;
+     bool m_bReplayActionInHistory : 1;
++    bool m_bAutoPaste : 1;
++    bool m_pendingAutoPasteAfterHistorySelection : 1;
++    bool m_pendingAutoPasteClipboardReady : 1;
++    bool m_pendingAutoPasteFocusRestored : 1;
++    QString m_pendingAutoPasteUuid;
++    quint64 m_autoPasteGeneration = 0;
++    bool m_autoPasteTargetWasWindow = false;
++    QPointer<KWayland::Client::PlasmaWindowManagement> m_windowManagement;
++    QPointer<KWayland::Client::PlasmaWindow> m_autoPasteTarget;
++
+ 
+     URLGrabber *m_myURLGrabber;
+     QString m_lastURLGrabberTextSelection;
+@@ -133,5 +167,7 @@ private:
+     QString cycleText() const;
+     KActionCollection *m_collection;
+     QPointer<KNotification> m_notification;
+-    KWayland::Client::PlasmaShell *m_plasmashell;
++    KWayland::Client::PlasmaShell *m_plasmashell = nullptr;
++    /** Parented to Klipper via Registry::createFakeInput; QPointer clears if the compositor destroys it. */
++    QPointer<KWayland::Client::FakeInput> m_fakeInput;
+ };
+diff --git a/klipper/klipper.kcfg b/klipper/klipper.kcfg
+index c78b0fa..dcb33ee 100644
+--- a/klipper/klipper.kcfg
++++ b/klipper/klipper.kcfg
+@@ -69,6 +69,11 @@
+     <entry name="ActionsInfoMessageShown" type="Bool">
+         <default>true</default>
+     </entry>
++    <entry name="AutoPaste" type="Bool">
++      <label>Automatically paste after choosing an entry</label>
++      <default>false</default>
++      <tooltip>After you select an item from the clipboard history popup, simulate the Paste shortcut in the active window.</tooltip>
++    </entry>
+   </group>
+ 
+   <group name="Actions">
+diff --git a/klipper/klipperpopup.cpp b/klipper/klipperpopup.cpp
+index e0c09f4..ceccc72 100644
+--- a/klipper/klipperpopup.cpp
++++ b/klipper/klipperpopup.cpp
+@@ -25,7 +25,6 @@
+ #include <algorithm>
+ 
+ #include "historymodel.h"
+-#include "klipper.h"
+ 
+ using namespace Qt::StringLiterals;
+ 
+@@ -48,6 +47,7 @@ KlipperPopup::KlipperPopup()
+ 
+ void KlipperPopup::show()
+ {
++    Q_EMIT clipboardPopupOpening();
+     if (m_plasmashell) {
+         hide();
+     }
+diff --git a/klipper/klipperpopup.h b/klipper/klipperpopup.h
+index 90fc41b..872131d 100644
+--- a/klipper/klipperpopup.h
++++ b/klipper/klipperpopup.h
+@@ -37,6 +37,9 @@ public Q_SLOTS:
+     void hide();
+     void resizePopup();
+ 
++Q_SIGNALS:
++    void clipboardPopupOpening();
++
+ protected:
+     void showEvent(QShowEvent *event) override;
+ 
+diff --git a/klipper/systemclipboard.cpp b/klipper/systemclipboard.cpp
+index 5172143..a9b2d18 100644
+--- a/klipper/systemclipboard.cpp
++++ b/klipper/systemclipboard.cpp
+@@ -283,8 +283,12 @@ void SystemClipboard::setMimeData(const HistoryItemConstPtr &data, SelectionMode
+     }
+ 
+     auto job = new DatabaseRecordToMimeDataJob(this, data);
+-    connect(job, &KJob::finished, this, [this, job, mode, updateReason] {
++    const QString uuid = data->uuid();
++    connect(job, &KJob::finished, this, [this, job, mode, updateReason, uuid] {
+         setMimeDataInternal(mode & Selection ? job->mimeData() : nullptr, mode & Clipboard ? job->mimeData() : nullptr, updateReason);
++        if (mode & Clipboard) {
++            Q_EMIT historyItemClipboardSet(uuid, !job->error());
++        }
+     });
+     job->start();
+ }
+diff --git a/klipper/systemclipboard.h b/klipper/systemclipboard.h
+index 38cdcb5..c2d35fe 100644
+--- a/klipper/systemclipboard.h
++++ b/klipper/systemclipboard.h
+@@ -95,6 +95,7 @@ public:
+ Q_SIGNALS:
+     // Only emitted when data is valid
+     void newClipData(QClipboard::Mode mode, const QMimeData *data);
++    void historyItemClipboardSet(const QString &uuid, int success);
+     void ignored(QClipboard::Mode mode);
+     void receivedEmptyClipboard(QClipboard::Mode mode);
+ 
+diff --git a/shell/org.kde.plasmashell.desktop.cmake b/shell/org.kde.plasmashell.desktop.cmake
+index 20b2776..209b45c 100644
+--- a/shell/org.kde.plasmashell.desktop.cmake
++++ b/shell/org.kde.plasmashell.desktop.cmake
+@@ -44,5 +44,6 @@ Icon=plasma-symbolic
+ NoDisplay=true
+ X-systemd-skip=true
+ 
+-X-KDE-Wayland-Interfaces=org_kde_plasma_window_management,org_kde_kwin_keystate,zkde_screencast_unstable_v1,org_kde_plasma_activation_feedback,kde_lockscreen_overlay_v1
++# org_kde_kwin_fake_input: Klipper optional auto-paste (KWin allowInterface)
++X-KDE-Wayland-Interfaces=org_kde_plasma_window_management,org_kde_kwin_keystate,zkde_screencast_unstable_v1,org_kde_plasma_activation_feedback,kde_lockscreen_overlay_v1,org_kde_kwin_fake_input
+ X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2

@@ -1,0 +1,8 @@
+/src/
+/pkg/
+/build/
+*.pkg.tar.*
+*.tar.xz
+*.tar.xz.sig
+*.log
+__pycache__/

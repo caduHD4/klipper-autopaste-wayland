@@ -1,0 +1,9 @@
+{
+  "upstream": "https://invent.kde.org/plasma/plasma-workspace",
+  "tag": "v6.7.4",
+  "revision": "fd05f4c88ab093aee23ce137bf6f2412437c9bba",
+  "package_version": "6.7.4-3.3",
+  "patch_sha256": "7994786a676efb79354571acbbc7d01a818960989b3d7c60ecd730c844453a01",
+  "tested_session": "KWin Wayland",
+  "automatic_upstream_updates": false
+}
